@@ -5,6 +5,7 @@ import time as t
 from collections import deque
 from threading import Thread
 from collections import defaultdict
+import traceback
 
 # django specific imports
 from django.contrib.auth.decorators import login_required
@@ -22,7 +23,7 @@ from hierarchy.models import LineRelation
 from LoadIQWeb.views import get_or_set_session_variables
 from LoadIQWeb.models import Customer, Building, Device
 from LoadIQWeb.utils import execute_query, convert_to_int, GLOBAL_COLOR_LIST, GLOBAL_COLOR_LIST_PRODUCER, \
-    get_customer_name, create_vpn_route
+    get_customer_name, create_vpn_route, logger_for_email_error
 from users.models import UserBuildingAdmin
 
 
@@ -68,6 +69,7 @@ def real_time_building_data(request):
     devices = Device.objects.filter(building_id=building_id).values('id')
 
     for device in devices:
+        # Django server will always need a tunnel to the device
         create_vpn_route(device["id"])
 
     if building_id:
@@ -95,11 +97,7 @@ def stream(building_id, request):
         thread_data[key] = dict()
         queue_data[key] = dict()
         queue_data[key]['queue'] = deque(maxlen=3)
-        # queue_data[key]['previous_queue'] = deque(maxlen=1)
         queue_data[key]['name'] = 'queue_%s' % (str(device["id"]))
-
-        # create vpn route
-        # create_vpn_route(device["id"])
 
         thread_data[key]['thread'] = Thread(target=process_real_time_data, args=(queue_data[key]['queue'],
                                                                                  device["id"],
@@ -109,75 +107,67 @@ def stream(building_id, request):
         thread_data[key]['name'] = 'thread_%s' % (str(device["id"]))
         thread_data[key]['thread'].start()
 
-    t.sleep(3)  # lets wait for 2 secs to start and process thread
+    t.sleep(3)  # lets wait for 3 seconds to feed the queue and process the thread
 
     while True:
         session_time['time'] = t.time()
-        try:
-            time_key = int(t.time()) * 1000  # our custom time generation
-            real_power_data[time_key] = dict({'time_stamp': time_key})
-            real_power_data[time_key]['lines_real_power'] = {}
+        time_key = int(t.time()) * 1000  # our custom time generation
+        real_power_data[time_key] = dict({'time_stamp': time_key})
+        real_power_data[time_key]['lines_real_power'] = {}
 
-            for device in devices:
-                key = "device_%s" % str(device["id"])
-                # print len(queue_data[key]['queue'])
+        for device in devices:
+            key = "device_%s" % str(device["id"])
+            
+            try:
+                queue_item = json.loads(queue_data[key]['queue'].popleft())
+                for key, value in queue_item.iteritems():
+                    """ if key == 'line_9191': # for testing purpose
+                        print 'value send ', value """
+                    real_power_data[time_key]['lines_real_power'][key] = value
 
-                try:
-                    queue_item = json.loads(queue_data[key]['queue'].popleft())
-                    # queue_data[key]['previous_queue'].append(queue_item)
-                    for key, value in queue_item.iteritems():
-                        """ if key == 'line_9191': # for testing purpose
-                            print 'value send ', value """
-                        real_power_data[time_key]['lines_real_power'][key] = value
+            except IndexError:
+                # In case of queue is empty popleft() throw IndexError
+                # May be HOST API failed to return data for this[key] device
+                logger_for_email_error(traceback.format_exc())
 
-                except IndexError:
-                    # In case of queue is empty popleft() throw IndexError
-                    # May be HOST API failed to return data for this[key] device
-                    # print "Not Found data"
-                    # print "Queue is empty"
-                    # continue
-                    # queue_item = queue_data[key]['previous_queue'][0]
-                    pass
+        level_counter = 1
+        while level_counter <= virtual_line_data["max_level"]:
+            for virtual_line_value in virtual_line_data["virtual_line_info"].itervalues():
+                if virtual_line_value["level"] == level_counter:
+                    siblings_real_power = parent_real_power = 0
+                    try:
+                        parent_key = "line_%s" % virtual_line_value["parent"]
+                        parent_real_power = real_power_data[time_key]["lines_real_power"][parent_key]["real_power"]
+                    except KeyError:
+                        pass
 
-            level_counter = 1
-            while level_counter <= virtual_line_data["max_level"]:
-                for virtual_line_value in virtual_line_data["virtual_line_info"].itervalues():
-                    if virtual_line_value["level"] == level_counter:
-                        siblings_real_power = parent_real_power = 0
+                    for sibling in virtual_line_value["siblings"]:
+                        sibling_key = "line_%s" % sibling
                         try:
-                            parent_key = "line_%s" % virtual_line_value["parent"]
-                            parent_real_power = real_power_data[time_key]["lines_real_power"][parent_key]["real_power"]
+                            siblings_real_power += real_power_data[time_key]["lines_real_power"][sibling_key][
+                                "real_power"]
                         except KeyError:
                             pass
 
-                        for sibling in virtual_line_value["siblings"]:
-                            sibling_key = "line_%s" % sibling
-                            try:
-                                siblings_real_power += real_power_data[time_key]["lines_real_power"][sibling_key][
-                                    "real_power"]
-                            except KeyError:
-                                pass
+                    virtual_line_real_power = parent_real_power - siblings_real_power
+                    if virtual_line_real_power:
+                        virtual_line_key = "line_%s" % virtual_line_value["id"]
+                        real_power_data[time_key]['lines_real_power'][virtual_line_key] = {
+                            "real_power": virtual_line_real_power}
 
-                        virtual_line_real_power = parent_real_power - siblings_real_power
-                        if virtual_line_real_power:
-                            virtual_line_key = "line_%s" % virtual_line_value["id"]
-                            real_power_data[time_key]['lines_real_power'][virtual_line_key] = {
-                                "real_power": virtual_line_real_power}
+                else:
+                    continue
+            level_counter += 1
 
-                    else:
-                        continue
-                level_counter += 1
+        if real_power_data[time_key]['lines_real_power']:
+            yield "data: " + json.dumps(real_power_data[time_key]) + "\n\n"
 
-            if real_power_data[time_key]['lines_real_power']:
-                yield "data: " + json.dumps(real_power_data[time_key]) + "\n\n"
-
-            try:
-                del real_power_data[time_key]
-            except Exception:
-                pass
-            t.sleep(1)
-        except:
+        try:
+            del real_power_data[time_key]
+        except KeyError:
             pass
+
+        t.sleep(1)
 
 
 def process_real_time_data(q, device_id, circuit_information, session_time, s):
@@ -191,8 +181,7 @@ def process_real_time_data(q, device_id, circuit_information, session_time, s):
     try:
         r = s.get(real_time_api_url, stream=True)
     except Exception as e:
-        print("Streaming is working??? ")
-        print str(e)
+        create_vpn_route(device_id)
         return
 
     device_key = "device_%s" % device_id
@@ -222,9 +211,7 @@ def process_real_time_data(q, device_id, circuit_information, session_time, s):
                 # testing_value = 0
                 for circuit_key, value in circuit_data.iteritems():
                     try:
-                        """ if circuit_key == 'circuit_28' or circuit_key == 'circuit_29' or circuit_key == 'circuit_30':
-                            testing_value += value['avg_real_power'] # testing purpose
-                        """
+                        
                         circuit_data = circuit_information[device_key][circuit_key]
                         line_key = 'line_%s' % circuit_data['line_id']
                         if line_key not in real_power_data[time_stamp]:
@@ -232,10 +219,7 @@ def process_real_time_data(q, device_id, circuit_information, session_time, s):
                         real_power_data[time_stamp][line_key]['real_power'] += value['avg_real_power']
                     except KeyError:
                         pass
-                """ if testing_value != 0:  # testing purpose
-                    print "recieved data"
-                    print testing_value
-                    print " = "*2 """
+                
                 """
                 If connection is dead up to five seconds, close the threads
                 """
@@ -384,9 +368,6 @@ def circuit_and_line_data_for_real_time_building_api(building_id):
                     and circuit.phase_no > 0
             group by device.id) as count_data ON line_data.device_id = count_data.device_id
     """.format(building_id)
-
-    # cursor = get_cursor()
-    # cursor.execute(query)
 
     result_set = execute_query(query)
 
